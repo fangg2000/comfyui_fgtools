@@ -486,16 +486,421 @@ class InpaintConcat:
 
         return (result_image,)
 
+import requests
+import json
+import os
+
+class DoubaoChat:
+    # 配置项
+    API_URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
+    MODEL_NAME = "doubao-seed-1-6-250615"
+    # 密钥持久化文件路径 (保存在当前节点目录下)
+    _KEY_FILE = os.path.join(os.path.dirname(__file__), ".ark_api_key")
+    
+    # 类变量：缓存当前密钥
+    _cached_api_key = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        # 1. 尝试加载已保存的密钥
+        cls._load_saved_key()
+        
+        # 2. 生成掩码显示的密钥 (前6位 + *** + 后4位)
+        default_key = ""
+        if cls._cached_api_key:
+            key_len = len(cls._cached_api_key)
+            if key_len > 10:
+                default_key = f"{cls._cached_api_key[:6]}***{cls._cached_api_key[-4:]}"
+            else:
+                default_key = cls._cached_api_key # 太短则不掩码
+
+        return {
+            "required": {
+                "input": ("STRING", {
+                    "multiline": True, 
+                    "default": "你好呀。",
+                    "placeholder": "请输入你的问题..."
+                }),
+                "api_key": ("STRING", {
+                    "default": default_key,
+                    "multiline": False,
+                    "placeholder": "请输入 ARK_API_KEY"
+                }),
+                # 【新增】超时时长参数
+                "timeout_seconds": ("INT", {
+                    "default": 60,
+                    "min": 10,      # 最小1秒
+                    "max": 300,    # 最大5分钟（防止过长等待）
+                    "step": 1,
+                    "display": "number"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("response",)
+    FUNCTION = "execute"
+    CATEGORY = "🚀 AI/LLM"
+
+    def execute(self, input, api_key, timeout_seconds):
+        # --- 1. 确定使用的密钥 ---
+        use_key = None
+        
+        # 如果输入的密钥不含 '*'，认为是新密钥
+        if "*" not in api_key and api_key.strip() != "":
+            use_key = api_key.strip()
+        else:
+            # 使用缓存的密钥
+            if not self._cached_api_key:
+                raise ValueError("未保存有效密钥，请输入完整的 ARK_API_KEY (不含星号)")
+            use_key = self._cached_api_key
+
+        # --- 2. 构建请求 ---
+        headers = {
+            "Authorization": f"Bearer {use_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.MODEL_NAME,
+            "input": input
+        }
+
+        # --- 3. 发送请求 (使用配置的超时时长) ---
+        try:
+            # 【修改】timeout参数使用传入的 timeout_seconds
+            response = requests.post(self.API_URL, headers=headers, json=payload, timeout=timeout_seconds)
+            response.raise_for_status() # 抛出HTTP错误 (如 401, 500)
+            result = response.json()
+            
+            # --- 4. 解析响应 (适配 Responses API 格式) ---
+            output_content = ""
+            if "output" in result:
+                for item in result["output"]:
+                    if item.get("type") == "message":
+                        content_list = item.get("content", [])
+                        for cnt in content_list:
+                            if cnt.get("type") == "output_text":
+                                output_content += cnt.get("text", "")
+            
+            # --- 5. 如果成功，保存新密钥 (如果是新输入的) ---
+            if "*" not in api_key and api_key.strip() != "":
+                self._save_key(api_key.strip())
+
+            return (output_content, )
+
+        except requests.exceptions.Timeout:
+            # 超时无返回，直接返回原始input
+            return (input, )
+        except requests.exceptions.RequestException as e:
+            # 其他请求错误仍抛出异常
+            raise Exception(f"API 请求失败: {str(e)}")
+
+    # --- 辅助方法：密钥持久化 ---
+    @classmethod
+    def _load_saved_key(cls):
+        if cls._cached_api_key is None:
+            if os.path.exists(cls._KEY_FILE):
+                try:
+                    with open(cls._KEY_FILE, 'r', encoding='utf-8') as f:
+                        cls._cached_api_key = f.read().strip()
+                except Exception:
+                    pass
+
+    @classmethod
+    def _save_key(cls, key):
+        cls._cached_api_key = key
+        try:
+            with open(cls._KEY_FILE, 'w', encoding='utf-8') as f:
+                f.write(key)
+        except Exception as e:
+            print(f"[Warn] 无法保存密钥: {e}")
+
+
+class DeepSeekChat:
+    # 配置项
+    API_URL = "https://api.deepseek.com/chat/completions"
+    MODEL_NAME = "deepseek-chat"
+    # 密钥持久化文件
+    _KEY_FILE = os.path.join(os.path.dirname(__file__), ".deepseek_api_key")
+    
+    # 缓存密钥
+    _cached_api_key = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        # 加载已保存密钥
+        cls._load_saved_key()
+        
+        # 掩码显示
+        default_key = ""
+        if cls._cached_api_key:
+            key_len = len(cls._cached_api_key)
+            if key_len > 10:
+                default_key = f"{cls._cached_api_key[:6]}***{cls._cached_api_key[-4:]}"
+            else:
+                default_key = cls._cached_api_key
+
+        return {
+            "required": {
+                "input": ("STRING", {
+                    "multiline": True,
+                    "default": "Hello!",
+                    "placeholder": "输入你的问题..."
+                }),
+                "api_key": ("STRING", {
+                    "default": default_key,
+                    "multiline": False,
+                    "placeholder": "输入 DeepSeek API Key"
+                }),
+                "timeout_seconds": ("INT", {
+                    "default": 60,
+                    "min": 1,
+                    "max": 300,
+                    "step": 1,
+                    "display": "number"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("response",)
+    FUNCTION = "execute"
+    CATEGORY = "🚀 AI/LLM"
+
+    def execute(self, input, api_key, timeout_seconds):
+        # 1. 确定使用的密钥
+        use_key = None
+        if "*" not in api_key and api_key.strip() != "":
+            use_key = api_key.strip()
+        else:
+            if not self._cached_api_key:
+                raise ValueError("未保存有效密钥，请输入完整的 DeepSeek API Key")
+            use_key = self._cached_api_key
+
+        # 2. 请求头
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {use_key}"
+        }
+
+        # 3. DeepSeek 标准请求体
+        payload = {
+            "model": self.MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": input}
+            ],
+            "stream": False
+        }
+
+        # 4. 发送请求
+        try:
+            response = requests.post(
+                self.API_URL,
+                headers=headers,
+                json=payload,
+                timeout=timeout_seconds
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # 5. 解析 DeepSeek 返回格式
+            output_content = ""
+            try:
+                choices = result.get("choices", [])
+                if choices:
+                    output_content = choices[0]["message"]["content"]
+            except:
+                output_content = ""
+
+            # 6. 成功则保存新密钥
+            if "*" not in api_key and api_key.strip() != "":
+                self._save_key(api_key.strip())
+
+            return (output_content,)
+
+        except requests.exceptions.Timeout:
+            # 超时返回原始 input
+            return (input,)
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"DeepSeek API 请求失败: {str(e)}")
+
+    # 密钥保存/加载
+    @classmethod
+    def _load_saved_key(cls):
+        if cls._cached_api_key is None and os.path.exists(cls._KEY_FILE):
+            try:
+                with open(cls._KEY_FILE, 'r', encoding='utf-8') as f:
+                    cls._cached_api_key = f.read().strip()
+            except:
+                pass
+
+    @classmethod
+    def _save_key(cls, key):
+        cls._cached_api_key = key
+        try:
+            with open(cls._KEY_FILE, 'w', encoding='utf-8') as f:
+                f.write(key)
+        except:
+            print("[Warn] 无法保存 DeepSeek API Key")
+
+class PriorityLLMNode:
+    # DeepSeek 配置
+    DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+    DEEPSEEK_MODEL = "deepseek-chat"
+    DEEPSEEK_KEY_FILE = os.path.join(os.path.dirname(__file__), ".deepseek_api_key")
+    DEEPSEEK_TIMEOUT = 10  # 固定10秒超时
+    
+    # 豆包 Ark 配置
+    ARK_URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
+    ARK_MODEL = "doubao-seed-1-6-250615"
+    ARK_KEY_FILE = os.path.join(os.path.dirname(__file__), ".ark_api_key")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input": ("STRING", {
+                    "multiline": True,
+                    "default": "你好呀。",
+                    "placeholder": "输入你的问题..."
+                }),
+                "ds_timeout": ("INT", {
+                    "default": 10,
+                    "min": 5,
+                    "max": 300,
+                    "step": 1,
+                    "display": "number"
+                }),
+                "doubao_timeout": ("INT", {
+                    "default": 60,
+                    "min": 10,
+                    "max": 300,
+                    "step": 1,
+                    "display": "number"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("response",)
+    FUNCTION = "execute"
+    CATEGORY = "🚀 AI/LLM"
+
+    def execute(self, input, ds_timeout, doubao_timeout):
+        # --- 1. 优先尝试 DeepSeek (10秒超时) ---
+        deepseek_key = self._load_key(self.DEEPSEEK_KEY_FILE)
+        if deepseek_key:
+            try:
+                result = self._call_deepseek(deepseek_key, input, ds_timeout)
+                if result:
+                    return (result,)
+            except requests.exceptions.Timeout:
+                print(f"[Info] DeepSeek {ds_timeout}秒超时，切换至豆包")
+            except Exception as e:
+                print(f"[Info] DeepSeek 调用失败 ({str(e)})，切换至豆包")
+        
+        # --- 2. DeepSeek 失败，尝试豆包 ---
+        ark_key = self._load_key(self.ARK_KEY_FILE)
+        if not ark_key:
+            raise ValueError("未找到 DeepSeek 或 豆包 的有效密钥，请先在对应节点中配置并调用成功一次")
+        
+        try:
+            result = self._call_ark(ark_key, input, doubao_timeout)
+            return (result,)
+        except requests.exceptions.Timeout:
+            # 豆包也超时，返回原始 input
+            return (input,)
+        except Exception as e:
+            raise Exception(f"豆包 API 调用失败: {str(e)}")
+
+    # --- DeepSeek 调用 ---
+    def _call_deepseek(self, api_key, input_text, ds_timeout):
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        payload = {
+            "model": self.DEEPSEEK_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": input_text}
+            ],
+            "stream": False
+        }
+        response = requests.post(
+            self.DEEPSEEK_URL,
+            headers=headers,
+            json=payload,
+            timeout=ds_timeout
+        )
+        response.raise_for_status()
+        result = response.json()
+        choices = result.get("choices", [])
+        if choices:
+            return choices[0]["message"]["content"]
+        return ""
+
+    # --- 豆包 Ark 调用 ---
+    def _call_ark(self, api_key, input_text, timeout):
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": self.ARK_MODEL,
+            "input": input_text
+        }
+        response = requests.post(
+            self.ARK_URL,
+            headers=headers,
+            json=payload,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        result = response.json()
+        output_content = ""
+        if "output" in result:
+            for item in result["output"]:
+                if item.get("type") == "message":
+                    content_list = item.get("content", [])
+                    for cnt in content_list:
+                        if cnt.get("type") == "output_text":
+                            output_content += cnt.get("text", "")
+        return output_content
+
+    # --- 通用密钥加载 ---
+    def _load_key(self, key_file):
+        if os.path.exists(key_file):
+            try:
+                with open(key_file, 'r', encoding='utf-8') as f:
+                    key = f.read().strip()
+                    if key:
+                        return key
+            except:
+                pass
+        return None
+
+
+# --- 注册节点 ---
 # 节点映射
 NODE_CLASS_MAPPINGS = {
     "IsEmptyString": IsEmptyString,
     "SwitchString": SwitchString,
     "InpaintCut": InpaintCut,
     "InpaintConcat": InpaintConcat,
+    "DoubaoChat": DoubaoChat,
+    "DeepSeekChat": DeepSeekChat,
+    "PriorityLLMNode": PriorityLLMNode,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "IsEmptyString": "IsEmptyString",
     "SwitchString": "NotEmptyString",
     "InpaintCut": "Inpaint Cut",
     "InpaintConcat": "Inpaint Concat",
+    "DoubaoChat": "豆包 (chat API)",
+    "DeepSeekChat": "DeepSeek (chat API)",
+    "PriorityLLMNode": "LLM优先级 (DeepSeek→豆包)"
 }
