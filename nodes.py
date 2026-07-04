@@ -1,7 +1,7 @@
 import os, sys, json, uuid
 import torch
 import numpy as np
-import numpy as np
+import requests
 
 from PIL import Image
 from collections import deque
@@ -620,7 +620,7 @@ class DoubaoChat:
 class DeepSeekChat:
     # 配置项
     API_URL = "https://api.deepseek.com/chat/completions"
-    MODEL_NAME = "deepseek-chat"
+    MODEL_NAME = "deepseek-v4-flash"
     # 密钥持久化文件
     _KEY_FILE = os.path.join(os.path.dirname(__file__), ".deepseek_api_key")
     
@@ -691,6 +691,7 @@ class DeepSeekChat:
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": input}
             ],
+            "thinking": {"type": "enabled"},
             "stream": False
         }
 
@@ -745,10 +746,11 @@ class DeepSeekChat:
         except:
             print("[Warn] 无法保存 DeepSeek API Key")
 
+
 class PriorityLLMNode:
     # DeepSeek 配置
     DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-    DEEPSEEK_MODEL = "deepseek-chat"
+    DEEPSEEK_MODEL = "deepseek-v4-flash"
     DEEPSEEK_KEY_FILE = os.path.join(os.path.dirname(__file__), ".deepseek_api_key")
     DEEPSEEK_TIMEOUT = 10  # 固定10秒超时
     
@@ -827,6 +829,7 @@ class PriorityLLMNode:
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": input_text}
             ],
+            "thinking": {"type": "disabled"},
             "stream": False
         }
         response = requests.post(
@@ -882,6 +885,228 @@ class PriorityLLMNode:
                 pass
         return None
 
+# 定位图片对象
+import torch
+import numpy as np
+from PIL import Image
+
+class ImageTrimAndCenter:
+    """
+    自动移除图片 / Mask 四周的空白区域，并将内容居中放置到指定尺寸的画布上
+    - 支持 IMAGE 和 MASK 独立输入或同时输入
+    - 开启对齐模式时，以 Mask 边界为准裁剪图片，保证两者完全对齐
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "width": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
+                "height": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
+                "threshold": ("FLOAT", {"default": 0.99, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "fill_color": ("STRING", {"default": "#FFFFFF"}),
+                "align_with_mask": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("image", "mask", "crop_x", "crop_y", "crop_width", "crop_height")
+    FUNCTION = "trim_and_center"
+    CATEGORY = "image/transform"
+
+    def hex_to_rgb(self, hex_color):
+        """十六进制颜色转 0-1 范围 RGB 值"""
+        hex_color = hex_color.lstrip('#')
+        return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+
+    def find_content_bounds(self, arr, threshold):
+        """
+        查找非空白区域的边界
+        arr: 图片 [H, W, C] 或 Mask [H, W]，数值范围 0-1
+        threshold: 空白判定阈值，值越高判定越严格
+        返回: (left, top, right, bottom)
+        """
+        if arr.ndim == 3:
+            # 图片处理逻辑
+            h, w, c = arr.shape
+            if c >= 4:
+                # 带 Alpha 通道：透明视为空白
+                mask = arr[:, :, 3] > 0.01
+            else:
+                # RGB 图：接近白色视为空白
+                mask = np.any(arr[:, :, :3] < threshold, axis=2)
+        else:
+            # Mask 处理逻辑：接近黑色（值为0）视为空白
+            h, w = arr.shape
+            mask = arr > (1 - threshold)
+        
+        # 全空白时返回原图边界
+        if not np.any(mask):
+            return 0, 0, w, h
+        
+        # 计算有效内容的上下左右边界
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        
+        top = np.argmax(rows)
+        bottom = h - np.argmax(rows[::-1])
+        left = np.argmax(cols)
+        right = w - np.argmax(cols[::-1])
+        
+        return left, top, right, bottom
+
+    def trim_and_center(self, width, height, threshold, fill_color, align_with_mask, image=None, mask=None):
+        if image is None and mask is None:
+            raise ValueError("至少需要输入 image 或 mask 中的一个")
+        
+        fill_rgb = self.hex_to_rgb(fill_color)
+        crop_x = crop_y = crop_w = crop_h = 0
+        mask_bounds = []
+
+        # ========== 预计算 Mask 边界（用于对齐模式） ==========
+        if mask is not None and align_with_mask:
+            for b in range(mask.shape[0]):
+                m_np = mask[b].cpu().numpy()
+                bounds = self.find_content_bounds(m_np, threshold)
+                mask_bounds.append(bounds)
+            # 输出裁剪参数以 Mask 为准
+            crop_x, crop_y, crop_w, crop_h = mask_bounds[0][0], mask_bounds[0][1], \
+                                             mask_bounds[0][2] - mask_bounds[0][0], \
+                                             mask_bounds[0][3] - mask_bounds[0][1]
+
+        # ========== 处理图片 ==========
+        result_img_tensor = None
+        if image is not None:
+            batch_size = image.shape[0]
+            result_img_list = []
+            
+            for b in range(batch_size):
+                img_np = image[b].cpu().numpy()
+                img_h, img_w, img_c = img_np.shape
+                
+                # 对齐模式下使用 Mask 边界，否则自行计算
+                if mask_bounds and b < len(mask_bounds):
+                    left, top, right, bottom = mask_bounds[b]
+                else:
+                    left, top, right, bottom = self.find_content_bounds(img_np, threshold)
+                    # 非对齐模式下用图片边界作为输出参数
+                    if not mask_bounds and b == 0:
+                        crop_x, crop_y = left, top
+                        crop_w = right - left
+                        crop_h = bottom - top
+                
+                # 裁剪有效内容
+                content = img_np[top:bottom, left:right, :]
+                content_h, content_w = content.shape[:2]
+                
+                # 等比例缩放：仅缩小不放大，保持原始比例
+                scale = min(width / content_w, height / content_h)
+                if scale > 1.0:
+                    scale = 1.0
+                
+                new_content_w = int(content_w * scale)
+                new_content_h = int(content_h * scale)
+                
+                # 高质量缩放
+                content_pil = Image.fromarray((content * 255).astype(np.uint8))
+                content_pil = content_pil.resize((new_content_w, new_content_h), Image.LANCZOS)
+                content_scaled = np.array(content_pil).astype(np.float32) / 255.0
+                
+                # 创建目标画布
+                if img_c >= 4:
+                    canvas = np.zeros((height, width, img_c), dtype=np.float32)
+                    canvas[:, :, :3] = fill_rgb
+                    canvas[:, :, 3] = 1.0
+                else:
+                    canvas = np.zeros((height, width, 3), dtype=np.float32)
+                    canvas[:, :, 0] = fill_rgb[0]
+                    canvas[:, :, 1] = fill_rgb[1]
+                    canvas[:, :, 2] = fill_rgb[2]
+                
+                # 计算居中偏移
+                offset_x = (width - new_content_w) // 2
+                offset_y = (height - new_content_h) // 2
+                
+                # 粘贴内容（带 Alpha 混合）
+                if img_c >= 4:
+                    alpha = content_scaled[:, :, 3:4]
+                    for c in range(3):
+                        canvas[offset_y:offset_y+new_content_h, offset_x:offset_x+new_content_w, c] = \
+                            content_scaled[:, :, c] * alpha + \
+                            canvas[offset_y:offset_y+new_content_h, offset_x:offset_x+new_content_w, c] * (1 - alpha)
+                    canvas[offset_y:offset_y+new_content_h, offset_x:offset_x+new_content_w, 3] = \
+                        np.maximum(canvas[offset_y:offset_y+new_content_h, offset_x:offset_x+new_content_w, 3], 
+                                   content_scaled[:, :, 3])
+                else:
+                    canvas[offset_y:offset_y+new_content_h, offset_x:offset_x+new_content_w, :] = content_scaled
+                
+                result_img_list.append(canvas)
+            
+            result_img = np.stack(result_img_list, axis=0)
+            result_img_tensor = torch.from_numpy(result_img)
+        else:
+            # 无图片输入时返回填充色占位图
+            batch_size = mask.shape[0] if mask is not None else 1
+            canvas = np.zeros((height, width, 3), dtype=np.float32)
+            canvas[:, :, 0] = fill_rgb[0]
+            canvas[:, :, 1] = fill_rgb[1]
+            canvas[:, :, 2] = fill_rgb[2]
+            result_img = np.stack([canvas] * batch_size, axis=0)
+            result_img_tensor = torch.from_numpy(result_img)
+
+        # ========== 处理 Mask ==========
+        result_mask_tensor = None
+        if mask is not None:
+            mask_batch = mask.shape[0]
+            result_mask_list = []
+            
+            for b in range(mask_batch):
+                m_np = mask[b].cpu().numpy()
+                
+                # 使用自身边界（对齐模式下与预计算一致）
+                left, top, right, bottom = self.find_content_bounds(m_np, threshold)
+                
+                # 裁剪有效内容
+                content = m_np[top:bottom, left:right]
+                content_h, content_w = content.shape
+                
+                # 等比例缩放，与图片使用完全相同的缩放逻辑
+                scale = min(width / content_w, height / content_h)
+                if scale > 1.0:
+                    scale = 1.0
+                
+                new_content_w = int(content_w * scale)
+                new_content_h = int(content_h * scale)
+                
+                # 缩放 Mask（灰度模式，保持边缘平滑）
+                content_pil = Image.fromarray((content * 255).astype(np.uint8), mode='L')
+                content_pil = content_pil.resize((new_content_w, new_content_h), Image.LANCZOS)
+                content_scaled = np.array(content_pil).astype(np.float32) / 255.0
+                
+                # 创建目标 Mask 画布（背景为 0，即空白/无掩码）
+                canvas = np.zeros((height, width), dtype=np.float32)
+                
+                # 居中粘贴，偏移量与图片完全一致
+                offset_x = (width - new_content_w) // 2
+                offset_y = (height - new_content_h) // 2
+                canvas[offset_y:offset_y+new_content_h, offset_x:offset_x+new_content_w] = content_scaled
+                
+                result_mask_list.append(canvas)
+            
+            result_mask = np.stack(result_mask_list, axis=0)
+            result_mask_tensor = torch.from_numpy(result_mask)
+        else:
+            # 无 Mask 输入时返回全 0 占位 Mask
+            batch_size = image.shape[0] if image is not None else 1
+            result_mask_tensor = torch.zeros((batch_size, height, width), dtype=torch.float32)
+        
+        return (result_img_tensor, result_mask_tensor, crop_x, crop_y, crop_w, crop_h)
+
+
 
 # --- 注册节点 ---
 # 节点映射
@@ -893,6 +1118,7 @@ NODE_CLASS_MAPPINGS = {
     "DoubaoChat": DoubaoChat,
     "DeepSeekChat": DeepSeekChat,
     "PriorityLLMNode": PriorityLLMNode,
+    "ImageTrimAndCenter": ImageTrimAndCenter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -902,5 +1128,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "InpaintConcat": "Inpaint Concat",
     "DoubaoChat": "豆包 (chat API)",
     "DeepSeekChat": "DeepSeek (chat API)",
-    "PriorityLLMNode": "LLM优先级 (DeepSeek→豆包)"
+    "PriorityLLMNode": "LLM优先级 (DeepSeek→豆包)",
+    "ImageTrimAndCenter": "Trim Blank & Center",
 }
